@@ -46,7 +46,7 @@
 
 ## 👤 Автор
 
-**Matvey**
+**@dedyaSerey**
 
 ---
 
