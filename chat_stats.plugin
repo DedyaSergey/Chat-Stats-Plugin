@@ -1,0 +1,223 @@
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from datetime import datetime, timedelta
+from ui.alert import AlertDialogBuilder
+from client_utils import get_last_fragment
+from android_utils import run_on_ui_thread, log
+
+__id__ = "chat_stats"
+__name__ = "Chat Stats"
+__description__ = "Локальная статистика твоей активности в чатах"
+__author__ = "@DedyaSerey"
+__version__ = "1.3.3"
+__icon__ = "exteraPlugins/1"
+__min_version__ = "12.1.1"
+
+
+class ChatStatsPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.add_on_send_message_hook()
+        self.log("Chat Stats loaded")
+
+    def _chat_id(self, params):
+        peer = getattr(params, "peer", None)
+
+        try:
+            if isinstance(peer, (int, float)):
+                return str(int(peer))
+        except Exception:
+            pass
+
+        if peer is not None:
+            for name in ("user_id", "chat_id", "channel_id"):
+                try:
+                    value = getattr(peer, name, 0)
+                    if value:
+                        value = int(value)
+                        if name == "chat_id":
+                            return str(-value)
+                        if name == "channel_id":
+                            return str(-1000000000000 - value)
+                        return str(value)
+                except Exception:
+                    pass
+
+        for name in ("dialog_id", "dialogId", "did"):
+            try:
+                value = getattr(params, name, None)
+                if value is not None:
+                    return str(int(value))
+            except Exception:
+                pass
+
+        return "unknown"
+
+    def _load(self):
+        value = self.get_setting("stats", {})
+        return value if isinstance(value, dict) else {}
+
+    def _save(self, stats):
+        self.set_setting("stats", stats)
+
+    def _add_message(self, chat_id, text):
+        stats = self._load()
+        chat = stats.get(chat_id, {"messages": []})
+        messages = chat.get("messages", [])
+
+        if not isinstance(messages, list):
+            messages = []
+
+        messages.append({
+            "t": int(datetime.now().timestamp()),
+            "c": len(text)
+        })
+
+        if len(messages) > 5000:
+            messages = messages[-5000:]
+
+        chat["messages"] = messages
+        stats[chat_id] = chat
+        self._save(stats)
+
+    def _get_counts(self, chat_id):
+        stats = self._load()
+        chat = stats.get(chat_id, {})
+        messages = chat.get("messages", [])
+
+        now = datetime.now()
+        day_start = datetime(now.year, now.month, now.day).timestamp()
+        week_start = (now - timedelta(days=7)).timestamp()
+        month_start = (now - timedelta(days=30)).timestamp()
+
+        total = len(messages)
+        chars = sum(int(x.get("c", 0)) for x in messages)
+        today = sum(1 for x in messages if x.get("t", 0) >= day_start)
+        week = sum(1 for x in messages if x.get("t", 0) >= week_start)
+        month = sum(1 for x in messages if x.get("t", 0) >= month_start)
+
+        return total, chars, today, week, month
+
+    def _make_text(self, chat_id, period):
+        total, chars, today, week, month = self._get_counts(chat_id)
+
+        if period == "today":
+            title = "📅 Сегодня"
+            count = today
+            subtitle = "Активность за сегодняшний день"
+        elif period == "week":
+            title = "📆 Последние 7 дней"
+            count = week
+            subtitle = "Активность за последнюю неделю"
+        elif period == "month":
+            title = "🗓 Последние 30 дней"
+            count = month
+            subtitle = "Активность за последний месяц"
+        else:
+            title = "📊 За всё время"
+            count = total
+            subtitle = "Вся сохранённая статистика"
+
+        if total == 0:
+            return (
+                "📊 Chat Stats\n\n"
+                "Пока здесь ничего нет.\n"
+                "Отправь несколько сообщений и\n"
+                "снова открой статистику."
+            )
+
+        average = round(chars / total, 1) if total else 0
+
+        return (
+            f"📊 Chat Stats\n\n"
+            f"{title}\n"
+            f"{subtitle}\n\n"
+            f"💬 Сообщений: {count}\n"
+            f"🔤 Символов всего: {chars}\n"
+            f"✏️ В среднем: {average} символа/сообщение\n\n"
+            "Данные хранятся только на устройстве."
+        )
+
+    def _show_stats(self, chat_id, period="all"):
+        def show():
+            try:
+                fragment = get_last_fragment()
+                if not fragment:
+                    log("Chat Stats: no current fragment")
+                    return
+
+                activity = fragment.getParentActivity()
+                if not activity:
+                    log("Chat Stats: no parent activity")
+                    return
+
+                builder = AlertDialogBuilder(activity)
+                builder.set_title("📊 Chat Stats")
+                builder.set_message(self._make_text(chat_id, period))
+
+                def reopen(period):
+                    try:
+                        builder.dismiss()
+                    except Exception:
+                        pass
+                    self._show_stats(chat_id, period)
+
+                def today(b, w):
+                    reopen("today")
+
+                def week(b, w):
+                    reopen("week")
+
+                def month(b, w):
+                    reopen("month")
+
+                builder.set_positive_button("Сегодня", today)
+                builder.set_neutral_button("7 дней", week)
+                builder.set_negative_button("30 дней", month)
+
+                builder.create()
+                builder.set_cancelable(True)
+                builder.set_canceled_on_touch_outside(True)
+                builder.show()
+
+            except Exception as e:
+                log("Chat Stats dialog error: " + str(e))
+
+        run_on_ui_thread(show)
+
+    def on_send_message_hook(self, account: int, params) -> HookResult:
+        text = getattr(params, "message", None)
+
+        if not isinstance(text, str):
+            return HookResult()
+
+        text = text.strip()
+        if not text:
+            return HookResult()
+
+        chat_id = self._chat_id(params)
+        command = text.lower()
+
+        if command in (".stats", ".stat"):
+            self._show_stats(chat_id, "all")
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if command == ".stats today":
+            self._show_stats(chat_id, "today")
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if command == ".stats week":
+            self._show_stats(chat_id, "week")
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if command == ".stats month":
+            self._show_stats(chat_id, "month")
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        if text.startswith("."):
+            return HookResult()
+
+        try:
+            self._add_message(chat_id, text)
+        except Exception as e:
+            self.log("Chat Stats save error: " + str(e))
+
+        return HookResult()
